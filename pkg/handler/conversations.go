@@ -93,6 +93,7 @@ type addMessageParams struct {
 	threadTs    string
 	text        string
 	contentType string
+	postAs      string // "bot" or "user"
 }
 
 type addReactionParams struct {
@@ -228,12 +229,21 @@ func (ch *ConversationsHandler) ConversationsAddMessageHandler(ctx context.Conte
 		options = append(options, slack.MsgOptionDisableMediaUnfurl())
 	}
 
+	// Select the client based on post_as parameter
+	var postClient provider.SlackAPI
+	if params.postAs == "user" {
+		postClient = ch.apiProvider.SlackUser()
+	} else {
+		postClient = ch.apiProvider.SlackBot()
+	}
+
 	ch.logger.Debug("Posting Slack message",
 		zap.String("channel", params.channel),
 		zap.String("thread_ts", params.threadTs),
 		zap.String("content_type", params.contentType),
+		zap.String("post_as", params.postAs),
 	)
-	respChannel, respTimestamp, err := ch.apiProvider.Slack().PostMessageContext(ctx, params.channel, options...)
+	respChannel, respTimestamp, err := postClient.PostMessageContext(ctx, params.channel, options...)
 	if err != nil {
 		ch.logger.Error("Slack PostMessageContext failed", zap.Error(err))
 		return nil, err
@@ -599,6 +609,241 @@ func (ch *ConversationsHandler) ConversationsSearchHandler(ctx context.Context, 
 	return marshalMessagesToCSV(messages)
 }
 
+// ConversationsMarkReadHandler marks a conversation as read up to a given timestamp
+func (ch *ConversationsHandler) ConversationsMarkReadHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	ch.logger.Debug("ConversationsMarkReadHandler called", zap.Any("params", request.Params))
+
+	if ready, err := ch.apiProvider.IsReady(); !ready {
+		ch.logger.Error("API provider not ready", zap.Error(err))
+		return nil, err
+	}
+
+	channelID := request.GetString("channel_id", "")
+	if channelID == "" {
+		return nil, errors.New("channel_id is required")
+	}
+	channelID, err := ch.resolveChannelID(ctx, channelID)
+	if err != nil {
+		ch.logger.Error("Channel not found", zap.String("channel", channelID), zap.Error(err))
+		return nil, err
+	}
+
+	timestamp := request.GetString("timestamp", "")
+	if timestamp == "" {
+		return nil, errors.New("timestamp is required")
+	}
+	if !strings.Contains(timestamp, ".") {
+		return nil, errors.New("timestamp must be in format 1234567890.123456")
+	}
+
+	ch.logger.Debug("Marking conversation as read",
+		zap.String("channel", channelID),
+		zap.String("timestamp", timestamp),
+	)
+
+	err = ch.apiProvider.Slack().MarkConversationContext(ctx, channelID, timestamp)
+	if err != nil {
+		ch.logger.Error("Slack MarkConversationContext failed", zap.Error(err))
+		return nil, err
+	}
+
+	return mcp.NewToolResultText(fmt.Sprintf("Successfully marked channel %s as read up to %s", channelID, timestamp)), nil
+}
+
+// UnreadCountResult represents a channel's unread count info for CSV output
+type UnreadCountResult struct {
+	ChannelID          string `csv:"ChannelID"`
+	ChannelName        string `csv:"ChannelName"`
+	UnreadCount        int    `csv:"UnreadCount"`
+	UnreadCountDisplay int    `csv:"UnreadCountDisplay"`
+	LastRead           string `csv:"LastRead"`
+}
+
+// ConversationsUnreadCountsHandler returns unread counts for user's conversations
+func (ch *ConversationsHandler) ConversationsUnreadCountsHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	ch.logger.Debug("ConversationsUnreadCountsHandler called", zap.Any("params", request.Params))
+
+	if ready, err := ch.apiProvider.IsReady(); !ready {
+		ch.logger.Error("API provider not ready", zap.Error(err))
+		return nil, err
+	}
+
+	channelTypes := request.GetString("channel_types", "public_channel,private_channel,im,mpim")
+	onlyUnread := request.GetBool("only_unread", true)
+	limit := request.GetInt("limit", 100)
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 999 {
+		limit = 999
+	}
+
+	types := strings.Split(channelTypes, ",")
+	for i := range types {
+		types[i] = strings.TrimSpace(types[i])
+	}
+
+	params := &slack.GetConversationsForUserParameters{
+		Types:           types,
+		Limit:           limit,
+		ExcludeArchived: true,
+	}
+
+	var allChannels []slack.Channel
+	for {
+		channels, nextCursor, err := ch.apiProvider.SlackUser().GetConversationsForUserContext(ctx, params)
+		if err != nil {
+			ch.logger.Error("GetConversationsForUserContext failed", zap.Error(err))
+			return nil, err
+		}
+		allChannels = append(allChannels, channels...)
+
+		if nextCursor == "" || len(allChannels) >= limit {
+			break
+		}
+		params.Cursor = nextCursor
+	}
+
+	channelsMap := ch.apiProvider.ProvideChannelsMaps()
+
+	var results []UnreadCountResult
+	for _, channel := range allChannels {
+		if onlyUnread && channel.UnreadCount == 0 {
+			continue
+		}
+
+		channelName := channel.ID
+		if c, ok := channelsMap.Channels[channel.ID]; ok {
+			channelName = c.Name
+		}
+
+		results = append(results, UnreadCountResult{
+			ChannelID:          channel.ID,
+			ChannelName:        channelName,
+			UnreadCount:        channel.UnreadCount,
+			UnreadCountDisplay: channel.UnreadCountDisplay,
+			LastRead:           channel.LastRead,
+		})
+
+		if len(results) >= limit {
+			break
+		}
+	}
+
+	if len(results) == 0 {
+		return mcp.NewToolResultText("No channels with unread messages found."), nil
+	}
+
+	csvBytes, err := gocsv.MarshalBytes(&results)
+	if err != nil {
+		ch.logger.Error("Failed to marshal unread counts to CSV", zap.Error(err))
+		return nil, err
+	}
+
+	return mcp.NewToolResultText(string(csvBytes)), nil
+}
+
+// SavedItemResult represents a saved/starred item for CSV output
+type SavedItemResult struct {
+	Type      string `csv:"Type"`
+	Channel   string `csv:"Channel"`
+	Timestamp string `csv:"Timestamp"`
+	UserID    string `csv:"UserID"`
+	UserName  string `csv:"UserName"`
+	Text      string `csv:"Text"`
+	Time      string `csv:"Time"`
+}
+
+// ConversationsSavedItemsHandler returns the user's saved/starred items
+func (ch *ConversationsHandler) ConversationsSavedItemsHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	ch.logger.Debug("ConversationsSavedItemsHandler called", zap.Any("params", request.Params))
+
+	if ready, err := ch.apiProvider.IsReady(); !ready {
+		ch.logger.Error("API provider not ready", zap.Error(err))
+		return nil, err
+	}
+
+	limit := request.GetInt("limit", 20)
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+
+	page := request.GetInt("page", 1)
+	if page < 1 {
+		page = 1
+	}
+
+	params := slack.StarsParameters{
+		Count: limit,
+		Page:  page,
+	}
+
+	items, paging, err := ch.apiProvider.SlackUser().ListStarsContext(ctx, params)
+	if err != nil {
+		ch.logger.Error("ListStarsContext failed", zap.Error(err))
+		return nil, err
+	}
+
+	usersMap := ch.apiProvider.ProvideUsersMap()
+
+	var results []SavedItemResult
+	for _, item := range items {
+		result := SavedItemResult{
+			Type:    item.Type,
+			Channel: item.Channel,
+		}
+
+		if item.Message != nil {
+			result.Timestamp = item.Message.Timestamp
+			result.UserID = item.Message.User
+			result.Text = text.ProcessText(item.Message.Text)
+
+			if u, ok := usersMap.Users[item.Message.User]; ok {
+				result.UserName = u.Name
+			} else {
+				result.UserName = item.Message.User
+			}
+
+			if ts, err := text.TimestampToIsoRFC3339(item.Message.Timestamp); err == nil {
+				result.Time = ts
+			}
+		} else if item.File != nil {
+			result.Text = item.File.Name
+			result.Timestamp = item.Timestamp
+			result.UserID = item.File.User
+			if u, ok := usersMap.Users[item.File.User]; ok {
+				result.UserName = u.Name
+			}
+		}
+
+		results = append(results, result)
+	}
+
+	if len(results) == 0 {
+		return mcp.NewToolResultText("No saved items found."), nil
+	}
+
+	// Add pagination cursor info if there are more pages
+	if paging != nil && paging.Page < paging.Pages {
+		nextPage := fmt.Sprintf("Next page: %d of %d total pages (%d total items)", paging.Page+1, paging.Pages, paging.Total)
+		results = append(results, SavedItemResult{
+			Type: "pagination_info",
+			Text: nextPage,
+		})
+	}
+
+	csvBytes, err := gocsv.MarshalBytes(&results)
+	if err != nil {
+		ch.logger.Error("Failed to marshal saved items to CSV", zap.Error(err))
+		return nil, err
+	}
+
+	return mcp.NewToolResultText(string(csvBytes)), nil
+}
+
 func isChannelAllowedForConfig(channel, config string) bool {
 	if config == "" || config == "true" || config == "1" {
 		return true
@@ -919,11 +1164,18 @@ func (ch *ConversationsHandler) parseParamsToolAddMessage(ctx context.Context, r
 		return nil, errors.New("content_type must be either 'text/plain' or 'text/markdown'")
 	}
 
+	postAs := request.GetString("post_as", ch.apiProvider.DefaultPostAs())
+	if postAs != "bot" && postAs != "user" {
+		ch.logger.Error("Invalid post_as", zap.String("post_as", postAs))
+		return nil, errors.New("post_as must be either 'bot' or 'user'")
+	}
+
 	return &addMessageParams{
 		channel:     channel,
 		threadTs:    threadTs,
 		text:        msgText,
 		contentType: contentType,
+		postAs:      postAs,
 	}, nil
 }
 

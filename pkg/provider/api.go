@@ -156,6 +156,12 @@ type SlackAPI interface {
 	// Used to get channels list from both Slack and Enterprise Grid versions
 	GetConversationsContext(ctx context.Context, params *slack.GetConversationsParameters) ([]slack.Channel, string, error)
 
+	// Used to get channels with unread counts (users.conversations API)
+	GetConversationsForUserContext(ctx context.Context, params *slack.GetConversationsForUserParameters) ([]slack.Channel, string, error)
+
+	// Used to get saved/starred items (stars.list API)
+	ListStarsContext(ctx context.Context, params slack.StarsParameters) ([]slack.Item, *slack.Paging, error)
+
 	// Edge API methods
 	ClientUserBoot(ctx context.Context) (*edge.ClientUserBootResponse, error)
 	UsersSearch(ctx context.Context, query string, count int) ([]slack.User, error)
@@ -178,6 +184,13 @@ type ApiProvider struct {
 	transport string
 	client    SlackAPI
 	logger    *zap.Logger
+
+	// Dual-token support: when both xoxp and xoxb tokens are provided,
+	// userClient and botClient hold the respective clients.
+	userClient    SlackAPI
+	botClient     SlackAPI
+	hasDualTokens bool
+	defaultPostAs string // "bot" or "user"
 
 	rateLimiter        *rate.Limiter
 	cacheTTL           time.Duration
@@ -380,6 +393,14 @@ func (c *MCPSlackClient) GetFileContext(ctx context.Context, downloadURL string,
 	return c.slackClient.GetFileContext(ctx, downloadURL, writer)
 }
 
+func (c *MCPSlackClient) GetConversationsForUserContext(ctx context.Context, params *slack.GetConversationsForUserParameters) ([]slack.Channel, string, error) {
+	return c.slackClient.GetConversationsForUserContext(ctx, params)
+}
+
+func (c *MCPSlackClient) ListStarsContext(ctx context.Context, params slack.StarsParameters) ([]slack.Item, *slack.Paging, error) {
+	return c.slackClient.ListStarsContext(ctx, params)
+}
+
 func (c *MCPSlackClient) ClientUserBoot(ctx context.Context) (*edge.ClientUserBootResponse, error) {
 	return c.edgeClient.ClientUserBoot(ctx)
 }
@@ -429,14 +450,24 @@ func New(transport string, logger *zap.Logger) *ApiProvider {
 	xoxcToken := os.Getenv("SLACK_MCP_XOXC_TOKEN")
 	xoxdToken := os.Getenv("SLACK_MCP_XOXD_TOKEN")
 
-	// Warn if both user and bot tokens are set
+	// Dual-token mode: when both xoxp and xoxb are set, create two clients
 	if xoxpToken != "" && xoxbToken != "" {
-		logger.Warn(
+		logger.Info(
 			"Both SLACK_MCP_XOXP_TOKEN and SLACK_MCP_XOXB_TOKEN are set. "+
-				"Using User token (xoxp) for full features. "+
-				"Bot token will be ignored.",
+				"Dual-token mode enabled: post_as parameter controls which identity sends messages.",
 			zap.String("context", "console"),
 		)
+
+		userAuthProvider, err := auth.NewValueAuth(xoxpToken, "")
+		if err != nil {
+			logger.Fatal("Failed to create auth provider with XOXP token", zap.Error(err))
+		}
+		botAuthProvider, err := auth.NewValueAuth(xoxbToken, "")
+		if err != nil {
+			logger.Fatal("Failed to create auth provider with XOXB token", zap.Error(err))
+		}
+
+		return newWithDualTokens(transport, userAuthProvider, botAuthProvider, logger)
 	}
 
 	// Priority 1: XOXP token (User OAuth)
@@ -583,6 +614,98 @@ func newWithXOXC(transport string, authProvider auth.ValueAuth, logger *zap.Logg
 		ChannelsInv: make(map[string]string),
 	})
 	return ap
+}
+
+func newWithDualTokens(transport string, userAuthProvider, botAuthProvider auth.ValueAuth, logger *zap.Logger) *ApiProvider {
+	usersCache := os.Getenv("SLACK_MCP_USERS_CACHE")
+	if usersCache == "" {
+		cacheDir := getCacheDir()
+		usersCache = filepath.Join(cacheDir, "users_cache.json")
+	}
+
+	channelsCache := os.Getenv("SLACK_MCP_CHANNELS_CACHE")
+	if channelsCache == "" {
+		cacheDir := getCacheDir()
+		channelsCache = filepath.Join(cacheDir, "channels_cache_v2.json")
+	}
+
+	userClient, err := NewMCPSlackClient(userAuthProvider, logger)
+	if err != nil {
+		logger.Fatal("Failed to create user MCP Slack client", zap.Error(err))
+	}
+
+	botClient, err := NewMCPSlackClient(botAuthProvider, logger)
+	if err != nil {
+		logger.Fatal("Failed to create bot MCP Slack client", zap.Error(err))
+	}
+
+	defaultPostAs := os.Getenv("SLACK_MCP_DEFAULT_POST_AS")
+	if defaultPostAs == "" {
+		defaultPostAs = "bot"
+	}
+
+	logger.Info("Dual-token mode initialized",
+		zap.String("context", "console"),
+		zap.String("default_post_as", defaultPostAs),
+	)
+
+	ap := &ApiProvider{
+		transport:      transport,
+		client:         userClient, // primary client uses user token for full features
+		logger:         logger,
+		userClient:     userClient,
+		botClient:      botClient,
+		hasDualTokens:  true,
+		defaultPostAs:  defaultPostAs,
+		rateLimiter:    limiter.Tier2.Limiter(),
+		cacheTTL:       getCacheTTL(),
+		minRefreshInterval: getMinRefreshInterval(),
+		usersCachePath:    usersCache,
+		channelsCachePath: channelsCache,
+	}
+	ap.usersSnapshot.Store(&UsersCache{
+		Users:    make(map[string]slack.User),
+		UsersInv: make(map[string]string),
+	})
+	ap.channelsSnapshot.Store(&ChannelsCache{
+		Channels:    make(map[string]Channel),
+		ChannelsInv: make(map[string]string),
+	})
+	return ap
+}
+
+// SlackUser returns the user-token client. Falls back to the primary client if not in dual-token mode.
+func (ap *ApiProvider) SlackUser() SlackAPI {
+	if ap.userClient != nil {
+		return ap.userClient
+	}
+	return ap.client
+}
+
+// SlackBot returns the bot-token client. Falls back to the primary client if not in dual-token mode.
+func (ap *ApiProvider) SlackBot() SlackAPI {
+	if ap.botClient != nil {
+		return ap.botClient
+	}
+	return ap.client
+}
+
+// HasDualTokens returns true if both user and bot tokens are configured.
+func (ap *ApiProvider) HasDualTokens() bool {
+	return ap.hasDualTokens
+}
+
+// DefaultPostAs returns the default identity for posting messages ("bot" or "user").
+func (ap *ApiProvider) DefaultPostAs() string {
+	return ap.defaultPostAs
+}
+
+// HasUserToken returns true if a user token (xoxp) is available.
+func (ap *ApiProvider) HasUserToken() bool {
+	if ap.hasDualTokens {
+		return true
+	}
+	return !ap.IsBotToken()
 }
 
 func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {

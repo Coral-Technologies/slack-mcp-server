@@ -25,20 +25,26 @@ type MCPServer struct {
 }
 
 const (
-	ToolConversationsHistory       = "conversations_history"
-	ToolConversationsReplies       = "conversations_replies"
-	ToolConversationsAddMessage    = "conversations_add_message"
-	ToolReactionsAdd               = "reactions_add"
-	ToolReactionsRemove            = "reactions_remove"
-	ToolAttachmentGetData          = "attachment_get_data"
+	ToolConversationsHistory        = "conversations_history"
+	ToolConversationsReplies        = "conversations_replies"
+	ToolConversationsAddMessage     = "conversations_add_message"
+	ToolConversationsMarkRead       = "conversations_mark_read"
+	ToolConversationsUnreadCounts   = "conversations_unread_counts"
+	ToolConversationsSavedItems     = "conversations_saved_items"
+	ToolReactionsAdd                = "reactions_add"
+	ToolReactionsRemove             = "reactions_remove"
+	ToolAttachmentGetData           = "attachment_get_data"
 	ToolConversationsSearchMessages = "conversations_search_messages"
-	ToolChannelsList               = "channels_list"
+	ToolChannelsList                = "channels_list"
 )
 
 var ValidToolNames = []string{
 	ToolConversationsHistory,
 	ToolConversationsReplies,
 	ToolConversationsAddMessage,
+	ToolConversationsMarkRead,
+	ToolConversationsUnreadCounts,
+	ToolConversationsSavedItems,
 	ToolReactionsAdd,
 	ToolReactionsRemove,
 	ToolAttachmentGetData,
@@ -148,7 +154,7 @@ func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger, enabledToo
 	}
 
 	if shouldAddTool(ToolConversationsAddMessage, enabledTools, "SLACK_MCP_ADD_MESSAGE_TOOL") {
-		s.AddTool(mcp.NewTool(ToolConversationsAddMessage,
+		addMessageTool := mcp.NewTool(ToolConversationsAddMessage,
 		mcp.WithDescription("Add a message to a public channel, private channel, or direct message (DM, or IM) conversation by channel_id and thread_ts."),
 		mcp.WithTitleAnnotation("Send Message"),
 		mcp.WithDestructiveHintAnnotation(true),
@@ -166,7 +172,65 @@ func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger, enabledToo
 			mcp.DefaultString("text/markdown"),
 			mcp.Description("Content type of the message. Default is 'text/markdown'. Allowed values: 'text/markdown', 'text/plain'."),
 		),
-	), conversationsHandler.ConversationsAddMessageHandler)
+		mcp.WithString("post_as",
+			mcp.Description("Identity to post the message as. Allowed values: 'bot' (post as the bot) or 'user' (post as the authenticated user). Only effective when both SLACK_MCP_XOXP_TOKEN and SLACK_MCP_XOXB_TOKEN are configured."),
+		),
+	)
+		s.AddTool(addMessageTool, conversationsHandler.ConversationsAddMessageHandler)
+	}
+
+	if shouldAddTool(ToolConversationsMarkRead, enabledTools, "SLACK_MCP_MARK_READ_TOOL") {
+		s.AddTool(mcp.NewTool(ToolConversationsMarkRead,
+		mcp.WithDescription("Mark a conversation as read up to a specific message timestamp."),
+		mcp.WithTitleAnnotation("Mark Conversation Read"),
+		mcp.WithDestructiveHintAnnotation(true),
+		mcp.WithString("channel_id",
+			mcp.Required(),
+			mcp.Description("ID of the channel in format Cxxxxxxxxxx or its name starting with #... or @... aka #general or @username_dm."),
+		),
+		mcp.WithString("timestamp",
+			mcp.Required(),
+			mcp.Description("Timestamp of the message to mark as read up to, in format 1234567890.123456."),
+		),
+	), conversationsHandler.ConversationsMarkReadHandler)
+	}
+
+	// Only register unread_counts tool when a user token is available (not bot-only)
+	if provider.HasUserToken() && shouldAddTool(ToolConversationsUnreadCounts, enabledTools, "") {
+		s.AddTool(mcp.NewTool(ToolConversationsUnreadCounts,
+		mcp.WithDescription("Get unread message counts for conversations. Returns channels with their unread counts. Requires a user token (xoxp)."),
+		mcp.WithTitleAnnotation("Get Unread Counts"),
+		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithString("channel_types",
+			mcp.DefaultString("public_channel,private_channel,im,mpim"),
+			mcp.Description("Comma-separated channel types. Allowed values: 'mpim', 'im', 'public_channel', 'private_channel'. Default: all types."),
+		),
+		mcp.WithBoolean("only_unread",
+			mcp.DefaultBool(true),
+			mcp.Description("If true, only return channels with unread messages. Default is true."),
+		),
+		mcp.WithNumber("limit",
+			mcp.DefaultNumber(100),
+			mcp.Description("The maximum number of channels to return. Must be between 1 and 999."),
+		),
+	), conversationsHandler.ConversationsUnreadCountsHandler)
+	}
+
+	// Only register saved_items tool when a user token is available (not bot-only)
+	if provider.HasUserToken() && shouldAddTool(ToolConversationsSavedItems, enabledTools, "") {
+		s.AddTool(mcp.NewTool(ToolConversationsSavedItems,
+		mcp.WithDescription("Get saved (starred) items for the authenticated user. Returns messages, files, and other starred items. Requires a user token (xoxp)."),
+		mcp.WithTitleAnnotation("Get Saved Items"),
+		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithNumber("limit",
+			mcp.DefaultNumber(20),
+			mcp.Description("The maximum number of items to return per page. Must be between 1 and 100."),
+		),
+		mcp.WithNumber("page",
+			mcp.DefaultNumber(1),
+			mcp.Description("Page number for pagination. Default is 1."),
+		),
+	), conversationsHandler.ConversationsSavedItemsHandler)
 	}
 
 	if shouldAddTool(ToolReactionsAdd, enabledTools, "SLACK_MCP_REACTION_TOOL") {
